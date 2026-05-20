@@ -1,0 +1,210 @@
+name: CI/CD — Ask My Docs
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION:   "20"
+  AWS_REGION:     "us-east-1"
+
+# Prevent concurrent deploys to the same environment
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write   # OIDC token for AWS role assumption
+  contents: read
+
+jobs:
+
+  # ── 1. Python lint and security scan ──────────────────────────────────────
+  python-checks:
+    name: Python Lint + Security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dev tools
+        run: |
+          pip install \
+            bandit==1.7.8 \
+            flake8==7.0.0 \
+            pip-audit==2.7.2 \
+            safety==3.1.0
+
+      - name: flake8 lint
+        run: |
+          flake8 lambdas/ \
+            --max-line-length=120 \
+            --extend-ignore=E203,W503 \
+            --exclude=lambdas/*/requirements.txt
+
+      - name: Bandit security scan (SAST)
+        run: |
+          bandit -r lambdas/ \
+            -ll \
+            -x lambdas/index_creator \
+            --format json \
+            --output bandit-report.json || true
+          # Fail on HIGH severity findings
+          python -c "
+          import json, sys
+          with open('bandit-report.json') as f:
+              data = json.load(f)
+          highs = [r for r in data.get('results', []) if r['issue_severity'] == 'HIGH']
+          if highs:
+              print(f'FAIL: {len(highs)} HIGH severity Bandit findings:')
+              for h in highs: print(f'  {h[\"filename\"]}:{h[\"line_number\"]} {h[\"issue_text\"]}')
+              sys.exit(1)
+          print(f'Bandit passed ({len(data.get(\"results\", []))} findings, 0 HIGH)')
+          "
+
+      - name: pip-audit (CVE scan on all requirements)
+        run: |
+          for f in lambdas/*/requirements.txt; do
+            echo "Auditing $f"
+            pip-audit -r "$f" --progress-spinner=off
+          done
+
+      - name: Upload Bandit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-report
+          path: bandit-report.json
+
+  # ── 2. Unit + security tests ───────────────────────────────────────────────
+  python-tests:
+    name: Unit + Security Tests
+    runs-on: ubuntu-latest
+    needs: python-checks
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install test dependencies
+        run: |
+          pip install pytest pytest-cov pytest-xdist
+
+      - name: Run unit tests
+        run: |
+          python -m pytest tests/unit/ tests/security/ \
+            -v \
+            --tb=short \
+            --cov=lambdas \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            --cov-fail-under=80
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  # ── 3. CDK synth + cfn-nag ────────────────────────────────────────────────
+  cdk-checks:
+    name: CDK Synth + cfn-nag
+    runs-on: ubuntu-latest
+    needs: python-checks
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache:        npm
+          cache-dependency-path: cdk/package-lock.json
+
+      - name: Install CDK deps
+        working-directory: cdk
+        run: npm ci
+
+      - name: CDK synth
+        working-directory: cdk
+        env:
+          CDK_DEFAULT_ACCOUNT: "123456789012"
+          CDK_DEFAULT_REGION:  ${{ env.AWS_REGION }}
+        run: |
+          npx cdk synth 2>&1 | tee synth.log
+          if grep -i "error" synth.log; then
+            echo "CDK synth produced errors"
+            exit 1
+          fi
+
+      - name: Install cfn-nag
+        run: gem install cfn-nag
+
+      - name: cfn-nag scan (IaC security linting)
+        working-directory: cdk
+        run: |
+          cfn_nag_scan \
+            --input-path cdk.out/ \
+            --fail-on-warnings \
+            --profile ./cfn-nag-profile.yml 2>/dev/null || \
+          cfn_nag_scan \
+            --input-path cdk.out/ \
+            --fail-on-warnings
+
+  # ── 4. Deploy to AWS (main branch only) ───────────────────────────────────
+  deploy:
+    name: Deploy to AWS
+    runs-on: ubuntu-latest
+    needs: [python-tests, cdk-checks]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache:        npm
+          cache-dependency-path: cdk/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Configure AWS credentials via OIDC (no long-lived keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: GitHubActions-AskMyDocs-${{ github.run_id }}
+          aws-region:        ${{ env.AWS_REGION }}
+
+      - name: Install CDK deps
+        working-directory: cdk
+        run: npm ci
+
+      - name: CDK deploy
+        working-directory: cdk
+        run: |
+          npx cdk deploy AskMyDocsStack \
+            --require-approval never \
+            --outputs-file ../outputs.json
+
+      - name: Post-deploy smoke test
+        run: |
+          python scripts/smoke_test.py --outputs-file outputs.json
+
+      - name: Upload deploy outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-outputs
+          path: outputs.json
