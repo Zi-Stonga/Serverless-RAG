@@ -1,0 +1,8 @@
+outputs.json
+deploy.log
+cdk/cdk.out/
+cdk/node_modules/
+__pycache__/
+*.pyc
+lambdas/*/package/
+.env
